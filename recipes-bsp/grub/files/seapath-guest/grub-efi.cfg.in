@@ -1,0 +1,4 @@
+default=boot
+menuentry 'boot' --unrestricted{
+    linux /Image root=/dev/vda2 $kernel_parameters
+}
