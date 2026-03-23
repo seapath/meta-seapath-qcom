@@ -20,3 +20,6 @@ APPEND += " \
 "
 
 PREFERRED_VERSION_libvirt = "11.4.0"
+
+# Arm64 does not support compressed kernel
+KERNEL_IMAGETYPE = "Image"
