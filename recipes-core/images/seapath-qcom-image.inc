@@ -1,8 +1,6 @@
 # Copyright (C) 2026 Savoir-faire Linux, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-inherit ${@ 'image-qcom-deploy' if 'qcom' in d.getVar('MACHINEOVERRIDES') else ''}
-
 # Qualcomm boards need to have a ext4 image
 IMAGE_FSTYPES:qcom:append = " ext4"
 # wic generation is not compatible with qualcomm image deploy
