@@ -20,8 +20,8 @@ fi
 # Split $root into disk, partition and partition number
 regexp --set disk --set 2:part --set 3:part_num '^(.*),([a-z]+)(.*)' $root
 
-set part_num=3
-set boot_part_num=2
+set part_num=2
+set boot_part_num=1
 
 menuentry 'active_slot' --unrestricted{
     # Convert device to filesystem identifier
