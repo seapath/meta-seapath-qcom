@@ -9,6 +9,5 @@ IMAGE_FSTYPES:remove:qcom = "wic.bmap"
 IMAGE_FSTYPES:remove:qcom = "wic.qcow2"
 
 do_tar_image_boot_directory:qcom() {
-    cp -r ${IMAGE_ROOTFS}/EFI ${IMAGE_ROOTFS}/boot/
     tar -cJhf ${IMGDEPLOYDIR}/${IMAGE_BASENAME}-boot.tar.xz -C ${IMAGE_ROOTFS}/boot ./EFI ./Image
 }
