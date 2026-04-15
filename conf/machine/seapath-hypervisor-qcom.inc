@@ -3,6 +3,8 @@
 
 require conf/machine/seapath-machine-common-qcom.inc
 
+MACHINEOVERRIDES =. "seapath-hypervisor:"
+
 APPEND += " \
     ${@bb.utils.contains('DISTRO_FEATURES', 'seapath-overlay', 'init=/sbin/init.sh', '', d)} \
     default_hugepagesz=1G \
