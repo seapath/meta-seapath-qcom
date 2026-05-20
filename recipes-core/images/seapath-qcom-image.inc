@@ -11,3 +11,6 @@ IMAGE_FSTYPES:remove:qcom = "wic.qcow2"
 do_tar_image_boot_directory:qcom() {
     tar -cJhf ${IMGDEPLOYDIR}/${IMAGE_BASENAME}-boot.tar.xz -C ${IMAGE_ROOTFS}/boot ./EFI ./Image
 }
+
+do_generate_seapath_metadata:qcom() {
+}
