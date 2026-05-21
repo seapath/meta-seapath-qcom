@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 MACHINEOVERRIDES =. "seapath:"
+MACHINEOVERRIDES =. "seapath-qcom:"
 SERIAL_CONSOLES = "115200;ttyS0"
 EFI_PROVIDER = "grub-efi"
 
