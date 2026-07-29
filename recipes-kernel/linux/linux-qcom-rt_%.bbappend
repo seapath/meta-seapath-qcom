@@ -12,3 +12,7 @@ SRC_URI += " \
 
 # Enable debug traces in Kernel and tracing tools support (like LTTng or perf).
 SRC_URI:append:seapath-lttng = " file://traces.cfg"
+
+do_deploy:append() {
+   install -m 0644 .config $deployDir/config_kernel
+}
