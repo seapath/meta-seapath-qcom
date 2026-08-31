@@ -3,10 +3,14 @@
 
 # Qualcomm boards need to have a ext4 image
 IMAGE_FSTYPES:append:qcom = " ext4 qcomflash"
+
+IMAGE_INSTALL:append:qcom = " seapath-tune"
+
 # wic generation is not compatible with qualcomm image deploy
 IMAGE_FSTYPES:remove:qcom = "wic.gz"
 IMAGE_FSTYPES:remove:qcom = "wic.bmap"
 IMAGE_FSTYPES:remove:qcom = "wic.qcow2"
+IMAGE_FSTYPES:remove:qcom = "wic.qcow2.gz"
 
 do_tar_image_boot_directory:qcom() {
     tar -cJhf ${IMGDEPLOYDIR}/${IMAGE_BASENAME}-boot.tar.xz -C ${IMAGE_ROOTFS}/boot ./EFI ./Image

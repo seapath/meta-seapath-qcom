@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: deewsing <deewsing@qti.qualcomm.com>
+Date: Wed, 17 Jun 2026 16:00:00 +0530
+Subject: [PATCH] sched/core: skip sched_balance_trigger in sched_tick when RT task is runnable
+
+Upstream-Status: Pending
+
+On a PREEMPT_RT kernel, CPU0 is the tick_do_timer_cpu and cannot stop
+its periodic tick (nohz_idle). CPUs 1-3 (also nohz_idle) successfully
+stop their tick for seconds when idle. CPUs 4-7 are nohz_full.
+
+Every ~20th RT wakeup cycle (tick period 4ms / RT interval 200us = 20),
+the tick_nohz_handler expiry and the hrtimer_wakeup expiry for the RT
+thread both fall within the same hrtimer_interrupt on CPU0. Both timers
+are processed sequentially by __hrtimer_run_queues.
+
+When tick_nohz_handler runs after hrtimer_wakeup, it calls:
+  tick_sched_handle -> update_process_times -> sched_tick ->
+  sched_balance_trigger
+
+Because the tick fired ~903us late (jiffies advanced), rq->next_balance
+is in the past and sched_balance_trigger raises SCHED_SOFTIRQ and calls
+nohz_balancer_kick, which sends IPIs to all other CPUs. With all 8 CPUs
+waking their RT threads simultaneously (thundering herd), this causes
+~146us of additional hardirq latency on CPU0 while the RT thread is
+already enqueued and waiting to run.
+
+CPUs 1-3 are not affected because their tick is stopped for ~1.7 seconds
+when idle, so tick_nohz_handler is never expired when their RT wakeup
+fires. CPUs 4-7 are nohz_full and also unaffected.
+
+Fix by skipping sched_balance_trigger in sched_tick when an RT or DL
+task is runnable on this CPU. The RT task needs to run immediately;
+triggering a load balance softirq and sending IPIs at this point only
+adds latency without benefit. Load balancing will happen naturally once
+the RT task sleeps and the CPU goes idle again via sched_balance_newidle.
+
+Observed on IQ9075-EVK (SA8775P / Lemans, Cortex-A78C):
+  cyclictest -a -t -m -p90 -i200 -h400 --spike 150 -b 151 --tracemark
+  CPU0 hit 153us latency every ~20 cycles due to tick+RT timer collision.
+
+Fixes: RT latency spikes on IQ9075-EVK (SEAPATH hypervisor port)
+Signed-off-by: deewsing <deewsing@qti.qualcomm.com>
+---
+ kernel/sched/core.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 582c3847f483..3079648c15da 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5618,10 +5618,26 @@ void sched_tick(void)
+ 	perf_event_task_tick();
+
+ 	if (donor->flags & PF_WQ_WORKER)
+ 		wq_worker_tick(donor);
+
++	/*
++	 * Skip load balance trigger when an RT or DL task is runnable.
++	 *
++	 * On nohz_idle CPUs that are also tick_do_timer_cpu (e.g. CPU0),
++	 * the periodic tick fires in the same hrtimer_interrupt as the RT
++	 * wakeup timer every N cycles (tick_period / rt_interval). When
++	 * sched_balance_trigger runs here it raises SCHED_SOFTIRQ and sends
++	 * nohz balancer IPIs while the RT task is already enqueued, adding
++	 * ~146us of hardirq latency before the RT task can run.
++	 *
++	 * Load balancing will occur naturally via sched_balance_newidle once
++	 * the RT task sleeps and the CPU returns to idle.
++	 */
++	if (rq->rt.rt_nr_running || rq->dl.dl_nr_running)
++		return;
++
+ 	if (!scx_switched_all()) {
+ 		rq->idle_balance = idle_cpu(cpu);
+ 		sched_balance_trigger(rq);
+ 	}
+ }

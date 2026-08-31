@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: deewsing <deewsing@qti.qualcomm.com>
+Date: Wed, 17 Jun 2026 15:00:00 +0530
+Subject: [PATCH] clocksource/arm_arch_timer: add Cortex-A78C OOL workaround for erratum 1418040
+
+Upstream-Status: Pending
+
+The ARM Cortex-A78C (MIDR 0x410fd4b2, part 0xd4b) as used in the
+Qualcomm IQ-9075 EVK (SA8775P / Lemans) exhibits a spurious WFI exit
+followed by a ~150us delayed arch_timer interrupt delivery.
+
+Observed in ftrace on a PREEMPT_RT kernel with cpuidle disabled:
+  - CPU enters WFI (cpu_idle state=0)
+  - CPU exits WFI spuriously (cpu_idle state=4294967295) with no IRQ
+  - arch_timer IRQ arrives ~150us later despite CNTP_CVAL being
+    programmed correctly 150us earlier
+  - All 2953 other idle cycles in the same trace show 1us IRQ delivery
+
+This is a clock-domain crossing race between the arch_timer counter
+domain and the GIC interrupt delivery domain: CNTP_CVAL is written
+but the interrupt line is not asserted until the counter value is
+re-read from the stable counter domain.
+
+Fix in two parts:
+
+1. cpu_errata.c: add MIDR_CORTEX_A78C to erratum_1418040_list so that
+   ARM64_WORKAROUND_1418040 capability is set at boot on A78C CPUs.
+
+2. arm_arch_timer.c: add dedicated TVAL-based set_next_event handlers
+   for erratum 1418040. The existing ool_workarounds[] entry for 1418040
+   only sets disable_compat_vdso=true and has no set_next_event handlers,
+   so erratum_handler falls back to arch_timer_set_next_event_phys which
+   calls ISB+MRS cntpct_el0 and stalls ~148us on A78C.
+
+   The new handlers write CNTP_TVAL_EL0/CNTV_TVAL_EL0 (relative delta)
+   instead of CNTP_CVAL_EL0 (absolute compare). No counter read is
+   needed, so no ISB is needed before arming the timer.
+
+Observed latency before patch: 154us (150us arch_timer delay, 98%)
+Expected latency after patch:  <10us
+
+Fixes: RT latency spikes on IQ-9075 EVK (SEAPATH hypervisor port)
+Signed-off-by: deewsing <deewsing@qti.qualcomm.com>
+---
+ arch/arm64/kernel/cpu_errata.c       |  2 ++
+ drivers/clocksource/arm_arch_timer.c | 41 ++++++++++++++++++++++++++-
+ 2 files changed, 43 insertions(+), 0 deletions(-)
+
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 6c8c430..030dbab 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -398,6 +398,8 @@ static const struct midr_range erratum_1418040_list[] = {
+ 	MIDR_RANGE(MIDR_NEOVERSE_N1, 0, 0, 3, 1),
+ 	/* Kryo4xx Gold (rcpe to rfpf) => (r0p0 to r3p1) */
+ 	MIDR_RANGE(MIDR_QCOM_KRYO_4XX_GOLD, 0xc, 0xe, 0xf, 0xf),
++	/* Cortex-A78C all versions (IQ-9075 EVK / SA8775P) */
++	MIDR_ALL_VERSIONS(MIDR_CORTEX_A78C),
+ 	{},
+ };
+ #endif
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index 90aeff4..fb91918 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -306,6 +306,43 @@ static u64 notrace sun50i_a64_read_cntvct_el0(void)
+ }
+ #endif
+
++#ifdef CONFIG_ARM64_ERRATUM_1418040
++/*
++ * Cortex-A78C erratum 1418040: ISB before MRS cntpct_el0 stalls ~148us
++ * due to clock-domain crossing synchronization.  Avoid the stall by
++ * programming CNTP_TVAL_EL0 (relative delta) instead of CNTP_CVAL_EL0
++ * (absolute compare), so no counter read -- and therefore no ISB -- is
++ * needed before arming the timer.
++ */
++static __maybe_unused int
++erratum_1418040_set_next_event_phys(unsigned long evt,
++				    struct clock_event_device *clk)
++{
++	unsigned long ctrl;
++
++	ctrl = arch_timer_reg_read_cp15(ARCH_TIMER_PHYS_ACCESS, ARCH_TIMER_REG_CTRL);
++	ctrl |= ARCH_TIMER_CTRL_ENABLE;
++	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
++	arch_timer_reg_write_cp15(ARCH_TIMER_PHYS_ACCESS, ARCH_TIMER_REG_CTRL, ctrl);
++	write_sysreg((u32)evt, cntp_tval_el0);
++	return 0;
++}
++
++static __maybe_unused int
++erratum_1418040_set_next_event_virt(unsigned long evt,
++				    struct clock_event_device *clk)
++{
++	unsigned long ctrl;
++
++	ctrl = arch_timer_reg_read_cp15(ARCH_TIMER_VIRT_ACCESS, ARCH_TIMER_REG_CTRL);
++	ctrl |= ARCH_TIMER_CTRL_ENABLE;
++	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
++	arch_timer_reg_write_cp15(ARCH_TIMER_VIRT_ACCESS, ARCH_TIMER_REG_CTRL, ctrl);
++	write_sysreg((u32)evt, cntv_tval_el0);
++	return 0;
++}
++#endif /* CONFIG_ARM64_ERRATUM_1418040 */
++
+ #ifdef CONFIG_ARM_ARCH_TIMER_OOL_WORKAROUND
+ DEFINE_PER_CPU(const struct arch_timer_erratum_workaround *, timer_unstable_counter_workaround);
+ EXPORT_SYMBOL_GPL(timer_unstable_counter_workaround);
+@@ -412,6 +449,8 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
+ 		.id = (void *)ARM64_WORKAROUND_1418040,
+ 		.desc = "ARM erratum 1418040",
+ 		.disable_compat_vdso = true,
++		.set_next_event_phys = erratum_1418040_set_next_event_phys,
++		.set_next_event_virt = erratum_1418040_set_next_event_virt,
+ 	},
+ #endif
+ };

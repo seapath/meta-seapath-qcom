@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: deewsing <deewsing@qti.qualcomm.com>
+Date: Wed, 18 Jun 2026 16:30:00 +0530
+Subject: [PATCH] arch/arm64: arch_timer: avoid ISB stall on counter read for erratum 1418040
+
+Upstream-Status: Pending
+
+On Cortex-A78C (MIDR 0x410fd4b2), reading CNTPCT_EL0 or CNTVCT_EL0
+preceded by an ISB stalls approximately 148us due to a clock-domain
+crossing synchronisation delay. This is the hardware behaviour described
+by ARM erratum 1418040 (ARM64_WORKAROUND_1418040).
+
+The helpers __arch_counter_get_cntpct() and __arch_counter_get_cntvct()
+are generic counter-read helpers used from both kernel and vDSO code
+paths. They currently contain the following ALTERNATIVE:
+
+  ALTERNATIVE("isb\n mrs %0, cnt{p,v}ct_el0",
+              "nop\n mrs %0, CNT{P,V}CTSS_EL0",
+              ARM64_HAS_ECV)
+
+On CPUs with ECV (ARM64_HAS_ECV=1), the alternative patches in the
+CNTPCTSS/CNTVCTSS self-synchronising register reads, which do not
+require an ISB. On CPUs without ECV (ARM64_HAS_ECV=0), the default
+"isb + mrs cnt{p,v}ct_el0" sequence is left in place.
+
+Cortex-A78C is an ARMv8.2 CPU: it does not implement ECV, so
+ARM64_HAS_ECV=0 and the default ISB path is taken. On this CPU the ISB
+incurs the erratum 1418040 clock-domain crossing stall of ~148us.
+
+ARM64_HAS_ECV and ARM64_WORKAROUND_1418040 are mutually exclusive in
+practice: ECV requires ARMv8.6 or later, and erratum 1418040 only
+affects Cortex-A78C (ARMv8.2). No CPU sets both bits simultaneously.
+
+This patch changes the ALTERNATIVE in the four counter-read helpers
+(__arch_counter_get_cntpct, __arch_counter_get_cntvct, and the two
+arch_timer_read_cntpct/cntvct_el0 OOL helpers) to select on
+ARM64_WORKAROUND_1418040 instead of ARM64_HAS_ECV. The replacement
+sequence is a double-read:
+
+  mrs %0, cnt{p,v}ct_el0
+  mrs %0, cnt{p,v}ct_el0
+
+Both sequences are exactly 8 bytes (isb=4 + mrs=4 == mrs=4 + mrs=4),
+so the ALTERNATIVE size constraint is satisfied. The double-read avoids
+the ISB entirely; by the time the second MRS executes the counter value
+is stable. This approach follows the existing arm64_858921 workaround.
+
+Interaction with the ECV alternative:
+  - On ECV CPUs (ARM64_HAS_ECV=1, ARM64_WORKAROUND_1418040=0):
+    the workaround alternative is not selected; the default
+    "isb + mrs" sequence remains. This is correct because ECV CPUs
+    do not exhibit the 1418040 clock-domain crossing stall, so ISB
+    is harmless and the ECV CNTPCTSS path (selected elsewhere via
+    arch_timer_reg_read_stable) is unaffected.
+  - On A78C (ARM64_HAS_ECV=0, ARM64_WORKAROUND_1418040=1):
+    the workaround alternative is selected; the double-read replaces
+    the stalling "isb + mrs" sequence.
+  - On all other CPUs (both bits 0):
+    the default "isb + mrs" sequence is left in place unchanged.
+
+The vDSO uses __arch_counter_get_cntvct() for clock_gettime(). Without
+this fix every clock_gettime() call from userspace stalls ~148us on A78C.
+Observed in trace t8.txt: cyclictest wakes correctly in 3us but then
+takes 159us to read the timestamp, reporting 152us measured latency.
+
+Observed on IQ-9075 EVK (SA8775P / Lemans, Cortex-A78C):
+  Before: clock_gettime() stalls ~148us (ISB on every call)
+  After:  clock_gettime() completes in <1us (double-read, no ISB)
+
+Fixes: RT latency in cyclictest measurement path (SEAPATH JIRA-1786)
+Signed-off-by: deewsing <deewsing@qti.qualcomm.com>
+---
+ arch/arm64/include/asm/arch_timer.h | 40 ++++++++++++++++++++++------
+ 1 file changed, 32 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/include/asm/arch_timer.h b/arch/arm64/include/asm/arch_timer.h
+index f5794d5..a1c1aa0 100644
+--- a/arch/arm64/include/asm/arch_timer.h
++++ b/arch/arm64/include/asm/arch_timer.h
+@@ -66,9 +66,15 @@ static inline notrace u64 arch_timer_read_cntpct_el0(void)
+ {
+ 	u64 cnt;
+
++	/*
++	 * Erratum 1418040: ISB before MRS cntpct_el0 stalls ~148us on A78C
++	 * (clock-domain crossing). Replace with double-read (no ISB needed).
++	 * Both sequences are 8 bytes: isb(4)+mrs(4) == mrs(4)+mrs(4).
++	 * ECV CPUs do not have this erratum; they use the fast ISB path.
++	 */
+ 	asm volatile(ALTERNATIVE("isb\n mrs %0, cntpct_el0",
+-				 "nop\n" __mrs_s("%0", SYS_CNTPCTSS_EL0),
+-				 ARM64_HAS_ECV)
++				 "mrs %0, cntpct_el0\n mrs %0, cntpct_el0",
++				 ARM64_WORKAROUND_1418040)
+ 		     : "=r" (cnt));
+
+ 	return cnt;
+@@ -78,9 +84,13 @@ static inline notrace u64 arch_timer_read_cntvct_el0(void)
+ {
+ 	u64 cnt;
+
++	/*
++	 * Erratum 1418040: ISB before MRS cntvct_el0 stalls ~148us on A78C.
++	 * Double-read avoids the stall. ECV CPUs use the fast ISB path.
++	 */
+ 	asm volatile(ALTERNATIVE("isb\n mrs %0, cntvct_el0",
+-				 "nop\n" __mrs_s("%0", SYS_CNTVCTSS_EL0),
+-				 ARM64_HAS_ECV)
++				 "mrs %0, cntvct_el0\n mrs %0, cntvct_el0",
++				 ARM64_WORKAROUND_1418040)
+ 		     : "=r" (cnt));
+
+ 	return cnt;
+@@ -190,9 +190,10 @@ static __always_inline u64 __arch_counter_get_cntpct(void)
+ {
+ 	u64 cnt;
+
++	/* Erratum 1418040: double-read avoids ISB stall on A78C */
+ 	asm volatile(ALTERNATIVE("isb\n mrs %0, cntpct_el0",
+-				 "nop\n" __mrs_s("%0", SYS_CNTPCTSS_EL0),
+-				 ARM64_HAS_ECV)
++				 "mrs %0, cntpct_el0\n mrs %0, cntpct_el0",
++				 ARM64_WORKAROUND_1418040)
+ 		     : "=r" (cnt));
+ 	arch_counter_enforce_ordering(cnt);
+ 	return cnt;
+@@ -212,9 +212,14 @@ static __always_inline u64 __arch_counter_get_cntvct(void)
+ {
+ 	u64 cnt;
+
++	/*
++	 * Erratum 1418040: ISB before MRS cntvct_el0 stalls ~148us on A78C.
++	 * This is the vDSO clock_gettime() path -- every call stalls without fix.
++	 * Double-read avoids the stall. Same 8-byte size: isb+mrs == mrs+mrs.
++	 */
+ 	asm volatile(ALTERNATIVE("isb\n mrs %0, cntvct_el0",
+-				 "nop\n" __mrs_s("%0", SYS_CNTVCTSS_EL0),
+-				 ARM64_HAS_ECV)
++				 "mrs %0, cntvct_el0\n mrs %0, cntvct_el0",
++				 ARM64_WORKAROUND_1418040)
+ 		     : "=r" (cnt));
+ 	arch_counter_enforce_ordering(cnt);
+ 	return cnt;

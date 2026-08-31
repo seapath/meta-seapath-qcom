@@ -1,0 +1,61 @@
+From e8cfc579308c41a0b20dae1ade2848455f5873ee Mon Sep 17 00:00:00 2001
+From: deewsing <deewsing@qti.qualcomm.com>
+Date: Wed, 17 Jun 2026 10:59:34 +0530
+Subject: [PATCH] sched/fair: skip newidle balance when RT task is runnable
+
+Upstream-Status: Pending
+
+sched_balance_newidle() checks ttwu_pending to bail out early when a
+task is pending wakeup via the remote IPI path. However, when an RT
+task is woken via the local wakeup path (same CPU), ttwu_pending is
+never set. The RT task is directly enqueued onto the local RT runqueue
+and need_resched is set, but sched_balance_newidle() has no visibility
+into this and proceeds to call sched_balance_update_blocked_averages()
+which iterates all CPUs under preempt-disable.
+
+On an 8-core IQ9075-EVK with PREEMPT_RT this causes a 92-153us
+preemption-disabled window inside __schedule(), blocking a prio-99
+SCHED_FIFO cyclictest thread from running despite need_resched being
+set. This is a direct PREEMPT_RT latency violation.
+
+Fix by checking rt.rt_nr_running before entering the expensive load
+balancing path. If an RT task is already runnable on this CPU there
+is no point pulling more tasks from other CPUs.
+
+The blocked load averages will still be updated by the periodic
+nohz_idle_balance() and sched_balance_domains() paths so staleness
+is bounded to one scheduler tick.
+
+Fixes: RT latency spikes on IQ9075-EVK (SEAPATH hypervisor port)
+Signed-off-by: deewsing <deewsing@qti.qualcomm.com>
+---
+ kernel/sched/fair.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d9777c81db0d..5b2ae7972568 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -12885,6 +12885,19 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
+ 	if (this_rq->ttwu_pending)
+ 		return 0;
+
++	/*
++	 * An RT task was woken directly on this CPU (local wakeup path) and
++	 * is already enqueued on the RT runqueue. ttwu_pending is only set
++	 * for remote IPI wakeups so it won't catch this case. Skip the
++	 * expensive sched_balance_update_blocked_averages() which iterates
++	 * all CPUs under preempt-disable and causes RT latency spikes.
++	 *
++	 * Observed on IQ9075-EVK: 92-153us preemption-disabled window in
++	 * sched_balance_newidle() blocking a prio-99 RT cyclictest thread.
++	 */
++	if (this_rq->rt.rt_nr_running)
++		return 0;
++
+ 	/*
+ 	 * We must set idle_stamp _before_ calling sched_balance_rq()
+ 	 * for CPU_NEWLY_IDLE, such that we measure the this duration
+--
+2.43.0
+

@@ -1,0 +1,16 @@
+# Copyright (C) 2026 Savoir-faire Linux, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=SEAPATH RT tuning (CPU governor, cpuidle, IRQ affinity, workqueues)
+After=network.target
+Conflicts=irqbalance.service
+Before=kvm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/tune.sh
+
+[Install]
+WantedBy=multi-user.target
